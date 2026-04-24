@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import CoreAudio
 
 @main
 struct MicMuteMenuBarApp: App {
@@ -17,7 +18,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let statusMenu = NSMenu()
 
     private var isMuted = false
-    private var lastNonZeroInputVolume = 75
+    private let fallbackRestoreInputVolume = 75
+    private var lastNonZeroInputVolumeByDevice: [AudioDeviceID: Int] = [:]
+
+    private var currentInputDeviceID: AudioDeviceID?
+    private var observedInputVolumeDeviceID: AudioDeviceID?
+    private var observedInputVolumeAddresses: [AudioObjectPropertyAddress] = []
+    private var isDefaultInputDeviceObserverRegistered = false
+
+    private static let audioPropertyListenerProc: AudioObjectPropertyListenerProc = {
+        objectID,
+        numberAddresses,
+        addresses,
+        clientData in
+        guard let clientData else {
+            return noErr
+        }
+
+        let appDelegate = Unmanaged<AppDelegate>.fromOpaque(clientData).takeUnretainedValue()
+        appDelegate.handleAudioPropertyChange(
+            objectID: objectID,
+            numberAddresses: numberAddresses,
+            addresses: addresses
+        )
+        return noErr
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -40,7 +65,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         quitItem.target = self
         statusMenu.addItem(quitItem)
 
+        setupAudioObservers()
         refreshState()
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        teardownAudioObservers()
+    }
+
+    deinit {
+        teardownAudioObservers()
     }
 
     @objc private func handleStatusItemClick() {
@@ -73,12 +107,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func toggleMute() {
         let currentInput = getInputVolume()
+        let currentDeviceID = currentDefaultInputDeviceID()
+
+        if let currentDeviceID {
+            self.currentInputDeviceID = currentDeviceID
+        }
 
         if currentInput > 0 {
-            lastNonZeroInputVolume = currentInput
+            if let currentDeviceID {
+                lastNonZeroInputVolumeByDevice[currentDeviceID] = currentInput
+            }
             setInputVolume(0)
         } else {
-            let restoreVolume = max(lastNonZeroInputVolume, 1)
+            let rememberedVolume = currentDeviceID.flatMap { lastNonZeroInputVolumeByDevice[$0] } ?? fallbackRestoreInputVolume
+            let restoreVolume = max(rememberedVolume, 1)
             setInputVolume(restoreVolume)
         }
 
@@ -87,9 +129,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func refreshState() {
         let currentInput = getInputVolume()
+        let currentDeviceID = currentDefaultInputDeviceID()
 
-        if currentInput > 0 {
-            lastNonZeroInputVolume = currentInput
+        if let currentDeviceID {
+            self.currentInputDeviceID = currentDeviceID
+        }
+
+        if currentInput > 0, let currentDeviceID {
+            lastNonZeroInputVolumeByDevice[currentDeviceID] = currentInput
         }
 
         isMuted = (currentInput == 0)
@@ -125,6 +172,200 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func setInputVolume(_ value: Int) {
         let clamped = max(0, min(value, 100))
         _ = runAppleScript("set volume input volume \(clamped)")
+    }
+
+    private func setupAudioObservers() {
+        registerDefaultInputDeviceObserver()
+        handleDefaultInputDeviceChange()
+    }
+
+    private func teardownAudioObservers() {
+        unregisterInputVolumeObservers()
+        unregisterDefaultInputDeviceObserver()
+    }
+
+    private func handleDefaultInputDeviceChange() {
+        currentInputDeviceID = currentDefaultInputDeviceID()
+        rebindInputVolumeObservers(to: currentInputDeviceID)
+        refreshState()
+    }
+
+    private func handleAudioPropertyChange(
+        objectID: AudioObjectID,
+        numberAddresses: UInt32,
+        addresses: UnsafePointer<AudioObjectPropertyAddress>
+    ) {
+        let changedAddresses = UnsafeBufferPointer(start: addresses, count: Int(numberAddresses))
+
+        let defaultInputChanged = objectID == kAudioObjectSystemObject && changedAddresses.contains {
+            $0.mSelector == kAudioHardwarePropertyDefaultInputDevice
+        }
+
+        if defaultInputChanged {
+            DispatchQueue.main.async { [weak self] in
+                self?.handleDefaultInputDeviceChange()
+            }
+            return
+        }
+
+        guard objectID == observedInputVolumeDeviceID else {
+            return
+        }
+
+        let inputVolumeChanged = changedAddresses.contains { $0.mSelector == kAudioDevicePropertyVolumeScalar }
+        if inputVolumeChanged {
+            DispatchQueue.main.async { [weak self] in
+                self?.refreshState()
+            }
+        }
+    }
+
+    private func registerDefaultInputDeviceObserver() {
+        guard !isDefaultInputDeviceObserverRegistered else {
+            return
+        }
+
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultInputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+
+        let status = AudioObjectAddPropertyListener(
+            AudioObjectID(kAudioObjectSystemObject),
+            &address,
+            Self.audioPropertyListenerProc,
+            listenerClientData
+        )
+
+        if status == noErr {
+            isDefaultInputDeviceObserverRegistered = true
+        } else {
+            print("Failed to register default input device observer: \(status)")
+        }
+    }
+
+    private func unregisterDefaultInputDeviceObserver() {
+        guard isDefaultInputDeviceObserverRegistered else {
+            return
+        }
+
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultInputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+
+        let status = AudioObjectRemovePropertyListener(
+            AudioObjectID(kAudioObjectSystemObject),
+            &address,
+            Self.audioPropertyListenerProc,
+            listenerClientData
+        )
+
+        if status != noErr {
+            print("Failed to remove default input device observer: \(status)")
+        }
+
+        isDefaultInputDeviceObserverRegistered = false
+    }
+
+    private func rebindInputVolumeObservers(to deviceID: AudioDeviceID?) {
+        unregisterInputVolumeObservers()
+
+        guard let deviceID else {
+            return
+        }
+
+        observedInputVolumeDeviceID = deviceID
+
+        for address in makeInputVolumeObserverAddresses() {
+            var mutableAddress = address
+            let status = AudioObjectAddPropertyListener(
+                deviceID,
+                &mutableAddress,
+                Self.audioPropertyListenerProc,
+                listenerClientData
+            )
+
+            if status == noErr {
+                observedInputVolumeAddresses.append(address)
+            } else {
+                print(
+                    "Failed to register input volume observer for selector \(address.mSelector), element \(address.mElement): \(status)"
+                )
+            }
+        }
+    }
+
+    private func unregisterInputVolumeObservers() {
+        guard let observedInputVolumeDeviceID else {
+            observedInputVolumeAddresses.removeAll()
+            return
+        }
+
+        for address in observedInputVolumeAddresses {
+            var mutableAddress = address
+            let status = AudioObjectRemovePropertyListener(
+                observedInputVolumeDeviceID,
+                &mutableAddress,
+                Self.audioPropertyListenerProc,
+                listenerClientData
+            )
+
+            if status != noErr {
+                print(
+                    "Failed to remove input volume observer for selector \(address.mSelector), element \(address.mElement): \(status)"
+                )
+            }
+        }
+
+        observedInputVolumeAddresses.removeAll()
+        self.observedInputVolumeDeviceID = nil
+    }
+
+    private func makeInputVolumeObserverAddresses() -> [AudioObjectPropertyAddress] {
+        [
+            AudioObjectPropertyAddress(
+                mSelector: kAudioDevicePropertyVolumeScalar,
+                mScope: kAudioDevicePropertyScopeInput,
+                mElement: kAudioObjectPropertyElementMain
+            ),
+            AudioObjectPropertyAddress(
+                mSelector: kAudioDevicePropertyVolumeScalar,
+                mScope: kAudioDevicePropertyScopeInput,
+                mElement: kAudioObjectPropertyElementWildcard
+            ),
+        ]
+    }
+
+    private var listenerClientData: UnsafeMutableRawPointer {
+        Unmanaged.passUnretained(self).toOpaque()
+    }
+
+    private func currentDefaultInputDeviceID() -> AudioDeviceID? {
+        var deviceID = AudioDeviceID(kAudioObjectUnknown)
+        var propertySize = UInt32(MemoryLayout<AudioDeviceID>.size)
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultInputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+
+        let status = AudioObjectGetPropertyData(
+            AudioObjectID(kAudioObjectSystemObject),
+            &address,
+            0,
+            nil,
+            &propertySize,
+            &deviceID
+        )
+
+        guard status == noErr, deviceID != AudioDeviceID(kAudioObjectUnknown) else {
+            return nil
+        }
+
+        return deviceID
     }
 
     @discardableResult
