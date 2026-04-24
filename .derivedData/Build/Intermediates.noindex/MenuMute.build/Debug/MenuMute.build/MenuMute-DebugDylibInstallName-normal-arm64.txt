@@ -1,1 +1,0 @@
-@rpath/MenuMute.debug.dylib
