@@ -61,6 +61,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         statusMenu.addItem(.separator())
 
+        let soundSettingsItem = NSMenuItem(
+            title: "System sound settings",
+            action: #selector(openSystemSoundSettings),
+            keyEquivalent: ""
+        )
+        soundSettingsItem.target = self
+        statusMenu.addItem(soundSettingsItem)
+
+        statusMenu.addItem(.separator())
+
         let quitItem = NSMenuItem(title: "Quit", action: #selector(quitApp), keyEquivalent: "q")
         quitItem.target = self
         statusMenu.addItem(quitItem)
@@ -103,6 +113,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func quitApp() {
         NSApp.terminate(nil)
+    }
+
+    @objc private func openSystemSoundSettings() {
+        if #available(macOS 13.0, *) {
+            if let settingsURL = URL(string: "x-apple.systempreferences:com.apple.Sound-Settings.extension") {
+                NSWorkspace.shared.open(settingsURL)
+                return
+            }
+        }
+
+        let legacyPaneURL = URL(fileURLWithPath: "/System/Library/PreferencePanes/Sound.prefPane")
+        NSWorkspace.shared.open(legacyPaneURL)
     }
 
     private func toggleMute() {
