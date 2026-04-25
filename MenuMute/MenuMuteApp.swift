@@ -26,6 +26,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var observedInputVolumeAddresses: [AudioObjectPropertyAddress] = []
     private var isDefaultInputDeviceObserverRegistered = false
 
+    private enum InputControlKind {
+        case volume(AudioObjectPropertyAddress)
+        case mute(AudioObjectPropertyAddress)
+        case appleScript
+    }
+
     private static let audioPropertyListenerProc: AudioObjectPropertyListenerProc = {
         objectID,
         numberAddresses,
@@ -128,40 +134,90 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func toggleMute() {
-        let currentInput = getInputVolume()
         let currentDeviceID = currentDefaultInputDeviceID()
 
         if let currentDeviceID {
             self.currentInputDeviceID = currentDeviceID
         }
 
-        if currentInput > 0 {
-            if let currentDeviceID {
-                lastNonZeroInputVolumeByDevice[currentDeviceID] = currentInput
+        switch resolveInputControlKind(for: currentDeviceID) {
+        case .volume(let address):
+            guard
+                let currentDeviceID,
+                let currentInput = getInputVolume(deviceID: currentDeviceID, address: address)
+            else {
+                toggleMuteUsingAppleScript(currentDeviceID: currentDeviceID)
+                break
             }
-            setInputVolume(0)
-        } else {
-            let rememberedVolume = currentDeviceID.flatMap { lastNonZeroInputVolumeByDevice[$0] } ?? fallbackRestoreInputVolume
-            let restoreVolume = max(rememberedVolume, 1)
-            setInputVolume(restoreVolume)
+
+            if currentInput > 0 {
+                lastNonZeroInputVolumeByDevice[currentDeviceID] = currentInput
+                _ = setInputVolume(0, deviceID: currentDeviceID, address: address)
+            } else {
+                let rememberedVolume = lastNonZeroInputVolumeByDevice[currentDeviceID] ?? fallbackRestoreInputVolume
+                let restoreVolume = max(rememberedVolume, 1)
+                _ = setInputVolume(restoreVolume, deviceID: currentDeviceID, address: address)
+            }
+
+        case .mute(let address):
+            guard
+                let currentDeviceID,
+                let currentlyMuted = getInputMute(deviceID: currentDeviceID, address: address)
+            else {
+                toggleMuteUsingAppleScript(currentDeviceID: currentDeviceID)
+                break
+            }
+
+            _ = setInputMute(!currentlyMuted, deviceID: currentDeviceID, address: address)
+
+        case .appleScript:
+            toggleMuteUsingAppleScript(currentDeviceID: currentDeviceID)
         }
 
         refreshState()
     }
 
     private func refreshState() {
-        let currentInput = getInputVolume()
         let currentDeviceID = currentDefaultInputDeviceID()
 
         if let currentDeviceID {
             self.currentInputDeviceID = currentDeviceID
         }
 
-        if currentInput > 0, let currentDeviceID {
-            lastNonZeroInputVolumeByDevice[currentDeviceID] = currentInput
+        switch resolveInputControlKind(for: currentDeviceID) {
+        case .volume(let address):
+            guard
+                let currentDeviceID,
+                let currentInput = getInputVolume(deviceID: currentDeviceID, address: address)
+            else {
+                refreshStateFromAppleScript(currentDeviceID: currentDeviceID)
+                updateIcon()
+                updateMenuTitle()
+                return
+            }
+
+            if currentInput > 0 {
+                lastNonZeroInputVolumeByDevice[currentDeviceID] = currentInput
+            }
+            isMuted = (currentInput == 0)
+
+        case .mute(let address):
+            guard
+                let currentDeviceID,
+                let muted = getInputMute(deviceID: currentDeviceID, address: address)
+            else {
+                refreshStateFromAppleScript(currentDeviceID: currentDeviceID)
+                updateIcon()
+                updateMenuTitle()
+                return
+            }
+
+            isMuted = muted
+
+        case .appleScript:
+            refreshStateFromAppleScript(currentDeviceID: currentDeviceID)
         }
 
-        isMuted = (currentInput == 0)
         updateIcon()
         updateMenuTitle()
     }
@@ -184,16 +240,189 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func getInputVolume() -> Int {
+    private func toggleMuteUsingAppleScript(currentDeviceID: AudioDeviceID?) {
+        let currentInput = getInputVolumeFromAppleScript()
+
+        if currentInput > 0 {
+            if let currentDeviceID {
+                lastNonZeroInputVolumeByDevice[currentDeviceID] = currentInput
+            }
+            setInputVolumeWithAppleScript(0)
+        } else {
+            let rememberedVolume = currentDeviceID.flatMap { lastNonZeroInputVolumeByDevice[$0] } ?? fallbackRestoreInputVolume
+            let restoreVolume = max(rememberedVolume, 1)
+            setInputVolumeWithAppleScript(restoreVolume)
+        }
+    }
+
+    private func refreshStateFromAppleScript(currentDeviceID: AudioDeviceID?) {
+        let currentInput = getInputVolumeFromAppleScript()
+        if currentInput > 0, let currentDeviceID {
+            lastNonZeroInputVolumeByDevice[currentDeviceID] = currentInput
+        }
+        isMuted = (currentInput == 0)
+    }
+
+    private func getInputVolumeFromAppleScript() -> Int {
         let result = runAppleScript(#"input volume of (get volume settings)"#)
             .trimmingCharacters(in: .whitespacesAndNewlines)
 
         return Int(result) ?? 0
     }
 
-    private func setInputVolume(_ value: Int) {
+    private func setInputVolumeWithAppleScript(_ value: Int) {
         let clamped = max(0, min(value, 100))
         _ = runAppleScript("set volume input volume \(clamped)")
+    }
+
+    private func resolveInputControlKind(for deviceID: AudioDeviceID?) -> InputControlKind {
+        guard let deviceID else {
+            return .appleScript
+        }
+
+        if let address = firstSettableInputAddress(
+            deviceID: deviceID,
+            selector: kAudioDevicePropertyVolumeScalar
+        ) {
+            return .volume(address)
+        }
+
+        if let address = firstSettableInputAddress(
+            deviceID: deviceID,
+            selector: kAudioDevicePropertyMute
+        ) {
+            return .mute(address)
+        }
+
+        return .appleScript
+    }
+
+    private func firstSettableInputAddress(
+        deviceID: AudioDeviceID,
+        selector: AudioObjectPropertySelector
+    ) -> AudioObjectPropertyAddress? {
+        for element in [kAudioObjectPropertyElementMain, kAudioObjectPropertyElementWildcard] {
+            var address = AudioObjectPropertyAddress(
+                mSelector: selector,
+                mScope: kAudioDevicePropertyScopeInput,
+                mElement: element
+            )
+
+            guard AudioObjectHasProperty(deviceID, &address) else {
+                continue
+            }
+
+            var isSettable = DarwinBoolean(false)
+            let status = AudioObjectIsPropertySettable(deviceID, &address, &isSettable)
+
+            if status == noErr, isSettable.boolValue {
+                return address
+            }
+        }
+
+        return nil
+    }
+
+    private func getInputVolume(
+        deviceID: AudioDeviceID,
+        address: AudioObjectPropertyAddress
+    ) -> Int? {
+        var mutableAddress = address
+        var scalar: Float32 = 0
+        var propertySize = UInt32(MemoryLayout<Float32>.size)
+
+        let status = AudioObjectGetPropertyData(
+            deviceID,
+            &mutableAddress,
+            0,
+            nil,
+            &propertySize,
+            &scalar
+        )
+
+        guard status == noErr else {
+            return nil
+        }
+
+        let clamped = max(0, min(scalar, 1))
+        return Int((clamped * 100).rounded())
+    }
+
+    @discardableResult
+    private func setInputVolume(
+        _ value: Int,
+        deviceID: AudioDeviceID,
+        address: AudioObjectPropertyAddress
+    ) -> Bool {
+        var mutableAddress = address
+        let clamped = max(0, min(value, 100))
+        var scalar = Float32(clamped) / 100
+        let propertySize = UInt32(MemoryLayout<Float32>.size)
+
+        let status = AudioObjectSetPropertyData(
+            deviceID,
+            &mutableAddress,
+            0,
+            nil,
+            propertySize,
+            &scalar
+        )
+
+        if status != noErr {
+            print("Failed to set input volume via CoreAudio: \(status)")
+        }
+
+        return status == noErr
+    }
+
+    private func getInputMute(
+        deviceID: AudioDeviceID,
+        address: AudioObjectPropertyAddress
+    ) -> Bool? {
+        var mutableAddress = address
+        var muteValue: UInt32 = 0
+        var propertySize = UInt32(MemoryLayout<UInt32>.size)
+
+        let status = AudioObjectGetPropertyData(
+            deviceID,
+            &mutableAddress,
+            0,
+            nil,
+            &propertySize,
+            &muteValue
+        )
+
+        guard status == noErr else {
+            return nil
+        }
+
+        return muteValue != 0
+    }
+
+    @discardableResult
+    private func setInputMute(
+        _ muted: Bool,
+        deviceID: AudioDeviceID,
+        address: AudioObjectPropertyAddress
+    ) -> Bool {
+        var mutableAddress = address
+        var muteValue: UInt32 = muted ? 1 : 0
+        let propertySize = UInt32(MemoryLayout<UInt32>.size)
+
+        let status = AudioObjectSetPropertyData(
+            deviceID,
+            &mutableAddress,
+            0,
+            nil,
+            propertySize,
+            &muteValue
+        )
+
+        if status != noErr {
+            print("Failed to set input mute via CoreAudio: \(status)")
+        }
+
+        return status == noErr
     }
 
     private func setupAudioObservers() {
@@ -234,8 +463,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        let inputVolumeChanged = changedAddresses.contains { $0.mSelector == kAudioDevicePropertyVolumeScalar }
-        if inputVolumeChanged {
+        let inputStateChanged = changedAddresses.contains {
+            $0.mSelector == kAudioDevicePropertyVolumeScalar || $0.mSelector == kAudioDevicePropertyMute
+        }
+        if inputStateChanged {
             DispatchQueue.main.async { [weak self] in
                 self?.refreshState()
             }
@@ -355,6 +586,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             ),
             AudioObjectPropertyAddress(
                 mSelector: kAudioDevicePropertyVolumeScalar,
+                mScope: kAudioDevicePropertyScopeInput,
+                mElement: kAudioObjectPropertyElementWildcard
+            ),
+            AudioObjectPropertyAddress(
+                mSelector: kAudioDevicePropertyMute,
+                mScope: kAudioDevicePropertyScopeInput,
+                mElement: kAudioObjectPropertyElementMain
+            ),
+            AudioObjectPropertyAddress(
+                mSelector: kAudioDevicePropertyMute,
                 mScope: kAudioDevicePropertyScopeInput,
                 mElement: kAudioObjectPropertyElementWildcard
             ),
